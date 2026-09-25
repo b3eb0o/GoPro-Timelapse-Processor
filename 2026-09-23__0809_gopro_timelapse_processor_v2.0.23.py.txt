@@ -1,0 +1,1499 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GoPro Time-Lapse Vibe-Coding Processor
+Verarbeitet GoPro Hero 5 Black 4K-Zeitrafferaufnahmen mit interaktiver Menü-Führung,
+YouTube-Upload, Archivierung und Uploadmarker.
+Version: 2.0.23
+Datum: 2026-09-23
+"""
+__VERSION__ = "2.0.23"
+__DATUM__ = "2026-09-23"
+__BESCHREIBUNG__ = ("GoPro Processor mit externer Config (gopro_config.py), LRV-Testrender, "
+                     "YouTube-Upload, Archivierung, Resume-Upload. Fixes: Konsolen-Blockbuffering, "
+                     "ZeroDivisionError/stiller combined.mp4-Bug, custom_tags-Uebernahme, "
+                     "filelist.txt in TEMP_DIR, Token-Refresh-Persistenz, Thread-sichere "
+                     "Konsolenausgabe, Exit-Option nach Resume-Uploads, konfigurierbare "
+                     "Testrender-Dauer, Beschreibungs-Vorlagen (*-beschreibung.md/"
+                     "_beschreibung.md) aus Zentralordner, Anzeige der bisher benoetigten "
+                     "Renderzeit, automatische Hardware-Encoder-Erkennung (NVENC/QSV/AMF), "
+                     "Fix fuer eingefrorenes Bild (-fflags +genpts), Testrender verwendet "
+                     "die groesste LRV-/MP4-Datei, Aufnahmedatum wird jetzt aus den "
+                     "Video-Metadaten (creation_time) der GoPro-Datei gelesen statt aus dem "
+                     "Datei-Zeitstempel (der sich beim Kopieren aendern kann), Tags aus "
+                     "Beschreibungs-Vorlage werden vollstaendig (auch mehrzeilig) uebernommen "
+                     "und vor dem Upload sichtbar bestaetigt")
+
+# Console-Encoding fixen (Windows UTF-8)
+import sys
+import io
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True, write_through=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True, write_through=True)
+
+import os
+import subprocess
+import shutil
+import re
+import time
+import json
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple, Optional, Dict, Any
+
+# Windows-Konstanten für subprocess
+if sys.platform == "win32":
+    SW_SHOWNORMAL = 1
+    STARTF_USESHOWWINDOW = 0x00000001
+else:
+    SW_SHOWNORMAL = 1
+    STARTF_USESHOWWINDOW = 0x00000001
+
+# Standardwert fuer die Testrender-Dauer (Sekunden).
+DEFAULT_TEST_PREVIEW_DURATION = 20
+
+# Kandidaten fuer automatische Hardware-Encoder-Erkennung (Prioritaets-
+# Reihenfolge). libx264 (Software) ist immer der garantiert funktionierende
+# Fallback und steht deshalb NICHT in dieser Liste.
+HARDWARE_ENCODER_CANDIDATES = [
+    "h264_nvenc",        # NVIDIA (GeForce/Quadro)
+    "h264_qsv",          # Intel Quick Sync (integrierte GPU)
+    "h264_amf",          # AMD (Radeon)
+    "h264_videotoolbox", # Apple (macOS)
+]
+
+def format_hms(seconds: float) -> str:
+    """Formatiert Sekunden als 'Xh Ym Zs' / 'Ym Zs' / 'Zs' (kuerzeste sinnvolle Form)."""
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    elif minutes > 0:
+        return f"{minutes}m {secs}s"
+    else:
+        return f"{secs}s"
+
+# ============================================================================
+# Externe Konfiguration laden (gopro_config.py)
+# ============================================================================
+try:
+    import gopro_config as cfg
+    YOUTUBE_CLIENT_SECRETS_FILE = cfg.YOUTUBE_CLIENT_SECRETS_FILE
+    YOUTUBE_TOKEN_FILE = cfg.YOUTUBE_TOKEN_FILE
+    YOUTUBE_PLAYLIST_ID = cfg.YOUTUBE_PLAYLIST_ID
+    YOUTUBE_PRIVACY_STATUS = cfg.YOUTUBE_PRIVACY_STATUS
+    YOUTUBE_TAGS = cfg.YOUTUBE_TAGS
+    YOUTUBE_CATEGORY_ID = cfg.YOUTUBE_CATEGORY_ID
+    YOUTUBE_PUBLIC_STATS_VIEWABLE = cfg.YOUTUBE_PUBLIC_STATS_VIEWABLE
+    YOUTUBE_EMBEDDABLE = cfg.YOUTUBE_EMBEDDABLE
+    YOUTUBE_LICENSE = cfg.YOUTUBE_LICENSE
+    YOUTUBE_MADE_FOR_KIDS = cfg.YOUTUBE_MADE_FOR_KIDS
+    YOUTUBE_CONTAINS_SYNTHETIC_MEDIA = cfg.YOUTUBE_CONTAINS_SYNTHETIC_MEDIA
+    if cfg.BASE_DIR:
+        BASE_DIR = Path(cfg.BASE_DIR)
+    else:
+        BASE_DIR = Path(".")
+    if cfg.OUTPUT_DIR:
+        OUTPUT_DIR = Path(cfg.OUTPUT_DIR)
+    else:
+        OUTPUT_DIR = BASE_DIR / "output"
+    if cfg.ARCHIVE_DIR:
+        ARCHIVE_DIR = Path(cfg.ARCHIVE_DIR)
+    else:
+        ARCHIVE_DIR = BASE_DIR / "archiv"
+    if cfg.LOG_DIR:
+        LOG_DIR = Path(cfg.LOG_DIR)
+    else:
+        LOG_DIR = BASE_DIR / "logs"
+    if cfg.TEMP_DIR:
+        TEMP_DIR = Path(cfg.TEMP_DIR)
+    else:
+        TEMP_DIR = BASE_DIR / "temp"
+    _beschreibung_dir_cfg = getattr(cfg, "BESCHREIBUNG_DIR", "")
+    if _beschreibung_dir_cfg:
+        BESCHREIBUNG_DIR = Path(_beschreibung_dir_cfg)
+    else:
+        BESCHREIBUNG_DIR = BASE_DIR / "beschreibungen"
+    FFMPEG_ENCODER = getattr(cfg, "FFMPEG_ENCODER", "") or "auto"
+    FFMPEG_PRESET = getattr(cfg, "FFMPEG_PRESET", "")
+    print(f"✅ Konfiguration geladen aus: gopro_config.py")
+    print(f"   Playlist-ID: {YOUTUBE_PLAYLIST_ID}")
+    print(f"   Sichtbarkeit: {YOUTUBE_PRIVACY_STATUS}")
+    print(f"   Beschreibungs-Vorlagen: {BESCHREIBUNG_DIR.absolute()}")
+    print(f"   Video-Encoder (Konfiguration): {FFMPEG_ENCODER}" + (f", Preset: {FFMPEG_PRESET}" if FFMPEG_PRESET else ""))
+except ImportError:
+    print("❌ FEHLER: gopro_config.py wurde nicht gefunden!")
+    print("   Bitte erstelle die Datei im gleichen Verzeichnis wie dieses Skript.")
+    print("   Vorlage: gopro_config.py (siehe Dokumentation)")
+    sys.exit(1)
+except AttributeError as e:
+    print(f"❌ FEHLER: Fehlender Konfigurationswert in gopro_config.py: {e}")
+    sys.exit(1)
+
+# ============================================================================
+# Logger
+# ============================================================================
+class Logger:
+    """Logging-Klasse fuer alle Aktionen und Fehler."""
+    def __init__(self, log_dir: Path = None):
+        self.log_dir = log_dir or LOG_DIR
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_file = self.log_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    def log(self, message: str, level: str = "INFO"):
+        """Schreibt Log-Eintrag (erscheint IMMER auch auf der Konsole)."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"{timestamp} - {level} - {message}"
+        print(log_entry)
+        with open(self.log_file, 'a', encoding='utf-8') as f:
+            f.write(log_entry + "\n")
+
+    def error_and_exit(self, message: str):
+        """Fehlermeldung + Abbruch."""
+        self.log(message, "ERROR")
+        print(f"\n❌ FEHLER: {message}")
+        sys.exit(1)
+
+# ============================================================================
+# FFmpeg-Handler
+# ============================================================================
+class FFmpegHandler:
+    """FFmpeg-Operationen."""
+    def __init__(self, logger: Logger):
+        self.logger = logger
+        self.cpu_count = os.cpu_count() or 4
+        self.logger.log(f"CPU-Kerne erkannt: {self.cpu_count}")
+        self.encoder, self.preset = self._resolve_encoder()
+
+    def _probe_encoder_works(self, encoder_name: str) -> bool:
+        """Testet per echtem Mini-Testencode, ob ein Encoder tatsaechlich funktioniert."""
+        null_output = "NUL" if sys.platform == "win32" else "/dev/null"
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=5",
+            "-frames:v", "5",
+            "-c:v", encoder_name,
+            "-f", "null", null_output
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return False
+
+    def _auto_detect_encoder(self) -> str:
+        """Probiert Hardware-Encoder-Kandidaten durch, gibt ersten funktionierenden zurueck."""
+        print("\n🔍 Suche nach nutzbarer Hardware-Beschleunigung (einmaliger Test beim Start)...")
+        for candidate in HARDWARE_ENCODER_CANDIDATES:
+            works = self._probe_encoder_works(candidate)
+            status = "✅ verfuegbar" if works else "—  nicht nutzbar"
+            print(f"   {candidate:20} {status}")
+            self.logger.log(f"Encoder-Test '{candidate}': {'erfolgreich' if works else 'fehlgeschlagen'}")
+            if works:
+                print(f"  🚀 Verwende Hardware-Encoder: {candidate}")
+                self.logger.log(f"Automatisch erkannter Encoder: {candidate}")
+                return candidate
+        print("  ℹ️  Keine nutzbare Hardware-Beschleunigung gefunden - verwende 'libx264' (Software).")
+        self.logger.log("Keine Hardware-Beschleunigung gefunden, Fallback auf libx264")
+        return "libx264"
+
+    def _resolve_encoder(self) -> Tuple[str, str]:
+        """Ermittelt den zu verwendenden Encoder (auto-Erkennung oder verifizierte Konfiguration)."""
+        desired = FFMPEG_ENCODER
+        if desired == "auto":
+            return self._auto_detect_encoder(), FFMPEG_PRESET
+        if desired == "libx264":
+            return desired, FFMPEG_PRESET
+        print(f"\n🔍 Pruefe konfigurierten Encoder '{desired}' per Testencode...")
+        if self._probe_encoder_works(desired):
+            print(f"  ✅ Encoder '{desired}' funktioniert und wird verwendet.")
+            self.logger.log(f"Konfigurierter Encoder '{desired}' verifiziert und wird verwendet")
+            return desired, FFMPEG_PRESET
+        self.logger.log(
+            f"Konfigurierter Encoder '{desired}' funktioniert auf diesem System nicht. Fallback auf 'libx264'.",
+            "WARNING"
+        )
+        print(f"  ⚠️  Encoder '{desired}' funktioniert NICHT auf diesem System - Fallback auf 'libx264' (Software).")
+        return "libx264", FFMPEG_PRESET
+
+    def get_file_list(self, folder: str, limit_files: int = None, file_pattern: str = "*.MP4") -> List[Path]:
+        """MP4- oder LRV-Dateien im Ordner finden und zeitlich sortieren."""
+        folder_path = Path(folder)
+        if not folder_path.exists():
+            self.logger.error_and_exit(f"Ordner existiert nicht: {folder}")
+        files = sorted(folder_path.glob(file_pattern), key=lambda f: f.stat().st_mtime)
+        if limit_files:
+            files = files[:limit_files]
+            self.logger.log(f"Dateien auf {limit_files} begrenzt (Testrender)")
+        if not files:
+            self.logger.error_and_exit(f"Keine Dateien ({file_pattern}) gefunden in: {folder}")
+        self.logger.log(f"{len(files)} Dateien ({file_pattern}) gefunden")
+        return files
+
+    def concat_files(self, folder: str, output: str, limit_files: int = None, file_pattern: str = "*.MP4") -> str:
+        """Dateien concateneren (fuer Finalrender: immer ALLE Dateien, auch kleine).
+
+        '-fflags +genpts' gegen fehlerhafte/nicht-monotone Zeitstempel (PTS)
+        an GoPro-Chapter-Grenzen.
+        """
+        files = self.get_file_list(folder, limit_files, file_pattern)
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        filelist_path = TEMP_DIR / "filelist.txt"
+        with open(filelist_path, 'w', encoding='utf-8') as f:
+            for file in files:
+                f.write(f"file '{file.absolute()}'\n")
+        cmd = [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(filelist_path),
+            "-c", "copy",
+            output
+        ]
+        self.logger.log(f"Concateniere Dateien (+genpts): {len(files)} Dateien")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            self.logger.log(f"Concat abgeschlossen: {output}")
+            return output
+        except subprocess.CalledProcessError as e:
+            self.logger.error_and_exit(f"FFmpeg Concat fehlgeschlagen: {e.stderr}")
+
+    def adjust_speed_with_progress(self, input_file: str, output: str, factor: float, fps: int = 60, duration: Optional[float] = None, is_test: bool = False):
+        """Render mit Fortschrittsanzeige, ETA und Multithreading.
+
+        '-fflags +genpts' zusaetzlich auch hier auf der Eingabeseite ergaenzt
+        (Sicherheitsnetz gegen fehlerhafte Zeitstempel in der Quelldatei).
+        """
+        setpts_value = f"PTS/{factor}"
+        total_duration = self.get_duration(input_file)
+        if total_duration:
+            expected_output_duration = total_duration / factor
+            if is_test:
+                print(f"  📊 Testrender: {total_duration:.1f}s Source → {expected_output_duration:.1f}s Output (Faktor {factor})")
+            else:
+                print(f"  📊 Gesamtdauer: {total_duration:.1f}s → {expected_output_duration:.1f}s (Faktor {factor})")
+            print(f"  💻 CPU-Kerne: {self.cpu_count} (alle werden genutzt) | Encoder: {self.encoder}"
+                  + (f" | Preset: {self.preset}" if self.preset else ""))
+        cmd = [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts",
+            "-threads", "0",
+            "-i", input_file,
+            "-filter:v", f"setpts={setpts_value}",
+            "-r", str(fps),
+            "-c:v", self.encoder,
+        ]
+        if self.preset:
+            cmd.extend(["-preset", self.preset])
+        cmd.extend([
+            "-stats",
+            "-progress", "pipe:1"
+        ])
+        if duration:
+            cmd.extend(["-t", str(duration)])
+        cmd.append(output)
+        self.logger.log(f"Render mit Faktor {factor}, {fps} fps, {self.cpu_count} Threads, Encoder {self.encoder}"
+                         + (f", Preset {self.preset}" if self.preset else ""))
+        start_time = time.time()
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+            current_time = 0.0
+            eta_display = ""
+
+            print_lock = threading.Lock()
+
+            def read_stderr():
+                for line in process.stderr:
+                    line = line.strip()
+                    if "error" in line.lower() or "invalid" in line.lower():
+                        with print_lock:
+                            print(f"\n  ⚠️  {line}")
+
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
+            for line in process.stdout:
+                line = line.strip()
+                if line.startswith("out_time="):
+                    time_str = line.split("=")[1]
+                    elapsed = time.time() - start_time
+                    elapsed_display = format_hms(elapsed)
+                    if time_str != "N/A":
+                        parts = time_str.split(":")
+                        if len(parts) == 3:
+                            hours = int(parts[0])
+                            minutes = int(parts[1])
+                            seconds = float(parts[2])
+                            current_time = hours * 3600 + minutes * 60 + seconds
+                            if total_duration:
+                                adjusted_total = total_duration / factor
+                                percent = min(100, int((current_time / adjusted_total) * 100))
+                                if percent > 0:
+                                    estimated_total = elapsed / (percent / 100)
+                                    remaining = estimated_total - elapsed
+                                    eta_display = format_hms(remaining) + " verbleibend"
+                                bar_length = 30
+                                filled = int(bar_length * percent / 100)
+                                bar = "█" * filled + "░" * (bar_length - filled)
+                                with print_lock:
+                                    print(f"\r  ⏳ [{bar}] {percent}% | Bisher: {elapsed_display} | ⏱️  {eta_display}", end="", flush=True)
+                            else:
+                                with print_lock:
+                                    print(f"\r  ⏳ Bisher: {elapsed_display}", end="", flush=True)
+                if line.startswith("progress=end"):
+                    total_elapsed = format_hms(time.time() - start_time)
+                    with print_lock:
+                        print(f"\r  ✅ Render abgeschlossen! (Dauer: {total_elapsed})                    ")
+                    break
+            process.wait()
+            if process.returncode != 0:
+                self.logger.error_and_exit(f"FFmpeg Render fehlgeschlagen (Return-Code: {process.returncode})")
+            self.logger.log(f"Render abgeschlossen: {output} (Renderzeit: {format_hms(time.time() - start_time)})")
+        except Exception as e:
+            self.logger.error_and_exit(f"FFmpeg Render fehlgeschlagen: {e}")
+
+    def get_duration(self, input_file: str) -> float:
+        """Gesamtdauer einer Videodatei ermitteln (in Sekunden)."""
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            input_file
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            duration = float(result.stdout.strip())
+            return duration
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.strip() if e.stderr else str(e)
+            self.logger.log(f"ffprobe fehlgeschlagen fuer {input_file}: {stderr}", "WARNING")
+            return 0.0
+        except (ValueError, FileNotFoundError) as e:
+            self.logger.log(f"Dauer konnte nicht ermittelt werden fuer {input_file}: {e}", "WARNING")
+            return 0.0
+
+    def get_creation_time(self, input_file: str) -> Optional[str]:
+        """Liest das eingebettete Aufnahmedatum (creation_time-Tag) aus den
+        Metadaten einer Videodatei via ffprobe.
+
+        NEU in v2.0.23: GoPro schreibt beim Aufnehmen ein 'creation_time'-Feld
+        (z.B. '2026-06-15T14:23:45.000000Z') direkt in den Video-Container
+        (moov-Atom). Dieser Wert bleibt beim Kopieren/Verschieben der Datei
+        IMMER erhalten - im Gegensatz zum Dateisystem-Zeitstempel (mtime), der
+        sich beim Kopieren auf vielen Systemen/Tools auf den Kopierzeitpunkt
+        aendert. Das behebt das Problem, dass das Titeldatum bisher das
+        Tagesdatum der Verarbeitung zeigte statt des echten Aufnahmedatums.
+
+        Rueckgabe: 'YYYY-MM-DD' oder None, wenn kein gueltiges Datum in den
+        Metadaten gefunden wurde (z.B. bei Dateien ohne dieses Tag).
+        """
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format_tags=creation_time",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            input_file
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            raw = result.stdout.strip()
+            if not raw:
+                return None
+            date_part = raw[:10]
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", date_part):
+                return date_part
+            return None
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            return None
+
+# ============================================================================
+# VLC-Player (mit Vordergrund-Erzwingung)
+# ============================================================================
+class VLCPlayer:
+    """VLC-Player fuer Vorschauen."""
+    VLC_PATHS = [
+        r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+        r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+        os.path.expandvars(r"%PROGRAMFILES%\VideoLAN\VLC\vlc.exe"),
+        os.path.expandvars(r"%PROGRAMFILES(X86)%\VideoLAN\VLC\vlc.exe"),
+    ]
+
+    def __init__(self, logger: Logger):
+        self.logger = logger
+        self.vlc_path = self._find_vlc()
+
+    def _find_vlc(self) -> str:
+        """Sucht VLC im PATH oder an Standardpfaden."""
+        if shutil.which("vlc"):
+            self.logger.log("VLC im PATH gefunden")
+            return "vlc"
+        for vlc_path in self.VLC_PATHS:
+            if Path(vlc_path).exists():
+                self.logger.log(f"VLC gefunden: {vlc_path}")
+                return vlc_path
+        return None
+
+    def play(self, file: str, duration: Optional[int] = None, force_foreground: bool = True):
+        """VLC startet Datei im Vordergrund."""
+        if not self.vlc_path:
+            self.logger.error_and_exit(
+                "VLC nicht gefunden. Bitte VLC installieren oder Pfad anpassen.\n"
+                "Erwartete Pfade:\n"
+                + "\n".join(f"  - {p}" for p in self.VLC_PATHS)
+            )
+        if not Path(file).exists():
+            self.logger.error_and_exit(f"Datei existiert nicht: {file}")
+        cmd = [
+            self.vlc_path,
+            "--play-and-exit",
+            "--video-on-top",
+            "--no-video-title-show",
+        ]
+        kwargs = {}
+        if sys.platform == "win32" and force_foreground:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = SW_SHOWNORMAL
+            kwargs["startupinfo"] = startupinfo
+        if duration:
+            cmd.extend(["--stop-time", str(duration)])
+        cmd.append(file)
+        self.logger.log(f"VLC startet: {self.vlc_path} → {file}{' (' + str(duration) + 's)' if duration else ''}")
+        try:
+            subprocess.run(cmd, check=True, **kwargs)
+            self.logger.log("VLC Wiedergabe beendet")
+        except subprocess.CalledProcessError as e:
+            self.logger.error_and_exit(f"VLC fehlgeschlagen: {e}")
+
+# ============================================================================
+# Upload-Marker
+# ============================================================================
+class UploadMarker:
+    """Verwaltet Uploadmarker-Dateien fuer wiederaufnehmbare Uploads."""
+    def __init__(self, logger: Logger):
+        self.logger = logger
+
+    def marker_path(self, video_path: Path) -> Path:
+        """Pfad zur Marker-Datei."""
+        return video_path.with_name(video_path.name + ".uploaded.json")
+
+    def write_marker(self, video_path: Path, youtube_video_id: str, title: str, playlist_id: str = None):
+        """Schreibt Uploadmarker nach erfolgreichem Upload."""
+        path = self.marker_path(video_path)
+        temporary = path.with_name(path.name + ".part")
+        payload = {
+            "youtube_video_id": youtube_video_id,
+            "source": "youtube_upload",
+            "video_filename": video_path.name,
+            "title": title,
+            "playlist_id": playlist_id or YOUTUBE_PLAYLIST_ID,
+            "uploaded_at_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        }
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        os.replace(temporary, path)
+        self.logger.log(f"Uploadmarker geschrieben: {path}")
+        return payload
+
+    def read_marker(self, video_path: Path) -> Optional[Dict[str, Any]]:
+        """Liest Uploadmarker, falls vorhanden."""
+        path = self.marker_path(video_path)
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            if not payload.get("youtube_video_id"):
+                raise ValueError("youtube_video_id fehlt")
+            return payload
+        except Exception as exc:
+            self.logger.log(f"Ungueltiger Uploadmarker: {path} ({exc})", "WARNING")
+            return None
+
+# ============================================================================
+# Archiv-Manager
+# ============================================================================
+class ArchiveManager:
+    """Verschiebt Dateien nach erfolgreichem Upload ins Archiv."""
+    def __init__(self, logger: Logger, archive_dir: Path = None):
+        self.logger = logger
+        self.archive_dir = archive_dir or ARCHIVE_DIR
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+
+    def archive_with_retry(self, video_path: Path, max_attempts: int = 6, delay: int = 10) -> bool:
+        """Verschiebt Datei ins Archiv mit Retry-Logik."""
+        target = self.archive_dir / video_path.name
+        marker = UploadMarker(self.logger).marker_path(video_path)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if target.exists():
+                    if video_path.stat().st_size == target.stat().st_size:
+                        try:
+                            video_path.unlink()
+                            self.logger.log(f"Doppelte Quelldatei nach bestaetigter Archivkopie entfernt: {video_path}")
+                        except PermissionError:
+                            self.logger.log(f"Quelldatei gesperrt, bleibt liegen: {video_path}", "WARNING")
+                        return True
+                    else:
+                        raise RuntimeError(f"Archivdatei existiert mit abweichender Groesse: {target}")
+                else:
+                    os.replace(video_path, target)
+                    if marker.exists():
+                        archived_marker = target.with_name(target.name + ".uploaded.json")
+                        os.replace(marker, archived_marker)
+                    self.logger.log(f"Lokale Archivierung erfolgreich: {target}")
+                    return True
+            except PermissionError as exc:
+                if attempt == max_attempts:
+                    self.logger.log(f"Archivierung nach {max_attempts} Versuchen weiterhin gesperrt: {video_path}", "ERROR")
+                    return False
+                self.logger.log(f"Archivierung gesperrt | Versuch {attempt}/{max_attempts} | Wiederholung in {delay}s", "WARNING")
+                time.sleep(delay)
+        return False
+
+# ============================================================================
+# Beschreibungs-Vorlagen (*-beschreibung.md / *_beschreibung.md aus Zentralordner)
+# ============================================================================
+class BeschreibungTemplateManager:
+    """Sucht und parsed Beschreibungs-Vorlagen aus dem Zentralordner (BESCHREIBUNG_DIR)."""
+    HEADER_MAP = {
+        "titel": "title",
+        "title": "title",
+        "beschreibung": "description",
+        "description": "description",
+        "tags": "tags",
+        "aufnahmedatum": "recording_date",
+        "sichtbarkeit": "privacy_status",
+    }
+    FILENAME_PATTERNS = ["*-beschreibung.md", "*_beschreibung.md"]
+
+    def __init__(self, logger: Logger, templates_dir: Path):
+        self.logger = logger
+        self.templates_dir = templates_dir
+
+    def find_templates(self) -> List[Path]:
+        """Findet alle Beschreibungs-Vorlagen im Zentralordner (rekursiv)."""
+        if not self.templates_dir.exists():
+            self.logger.log(
+                f"Beschreibungs-Vorlagen-Ordner existiert nicht: {self.templates_dir.absolute()} "
+                "(wird beim naechsten Start automatisch angelegt)", "WARNING"
+            )
+            return []
+        seen = set()
+        files: List[Path] = []
+        for pattern in self.FILENAME_PATTERNS:
+            for f in self.templates_dir.rglob(pattern):
+                if f not in seen:
+                    seen.add(f)
+                    files.append(f)
+        files.sort(key=lambda f: f.name.lower())
+        if files:
+            self.logger.log(f"{len(files)} Beschreibungs-Vorlage(n) gefunden in {self.templates_dir.absolute()}")
+        else:
+            self.logger.log(
+                f"Keine Beschreibungs-Vorlagen gefunden in {self.templates_dir.absolute()} "
+                "(erwartetes Namensschema: '<name>-beschreibung.md' oder '<name>_beschreibung.md')",
+                "WARNING"
+            )
+        return files
+
+    def parse(self, path: Path) -> Dict[str, str]:
+        """Parsed eine Beschreibungs-Vorlage anhand von '# Ueberschrift'-Abschnitten.
+
+        Fix v2.0.23: Tags werden jetzt ueber ALLE Zeilen des Abschnitts hinweg
+        eingesammelt (vorher nur die erste Zeile), damit auch mehrzeilig
+        formatierte Tag-Listen in der Vorlage vollstaendig uebernommen werden.
+        """
+        raw = path.read_text(encoding='utf-8')
+        raw = re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
+        sections: Dict[str, str] = {}
+        current_key: Optional[str] = None
+        current_lines: List[str] = []
+        for line in raw.splitlines():
+            heading_match = re.match(r"^#\s+(.+?)\s*$", line)
+            if heading_match:
+                if current_key:
+                    sections[current_key] = "\n".join(current_lines).strip()
+                heading_raw = heading_match.group(1).strip().lower()
+                current_key = self.HEADER_MAP.get(heading_raw)
+                current_lines = []
+            else:
+                if current_key:
+                    current_lines.append(line)
+        if current_key:
+            sections[current_key] = "\n".join(current_lines).strip()
+
+        result: Dict[str, str] = {}
+        if sections.get("title"):
+            result["title"] = sections["title"].splitlines()[0].strip()
+        if sections.get("description"):
+            result["description"] = sections["description"].strip()
+        if sections.get("tags"):
+            # Fix v2.0.23: alle nicht-leeren Zeilen des Tags-Abschnitts
+            # zusammenfassen (statt nur splitlines()[0]).
+            tag_lines = [l.strip() for l in sections["tags"].splitlines() if l.strip()]
+            if tag_lines:
+                result["tags"] = ", ".join(tag_lines)
+        if sections.get("recording_date"):
+            candidate = sections["recording_date"].strip()
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", candidate):
+                result["recording_date"] = candidate
+            elif candidate:
+                self.logger.log(f"Ungueltiges Aufnahmedatum in Vorlage ignoriert: '{candidate}' ({path.name})", "WARNING")
+        if sections.get("privacy_status"):
+            candidate = sections["privacy_status"].strip().lower()
+            if candidate in ("private", "unlisted", "public"):
+                result["privacy_status"] = candidate
+            elif candidate:
+                self.logger.log(f"Ungueltige Sichtbarkeit in Vorlage ignoriert: '{candidate}' ({path.name})", "WARNING")
+        return result
+
+# ============================================================================
+# YouTube-Uploader
+# ============================================================================
+class YouTubeUploader:
+    """YouTube-Upload mit OAuth, Uploadmarker und Playlist-Zuordnung."""
+    def __init__(self, logger: Logger):
+        self.logger = logger
+        self.youtube = None
+        self._ensure_dependencies()
+
+    def _ensure_dependencies(self):
+        """Prueft, ob YouTube-API-Pakete verfuegbar sind."""
+        try:
+            from google.auth.transport.requests import Request
+            from google.oauth2.credentials import Credentials
+            from google_auth_oauthlib.flow import InstalledAppFlow
+            from googleapiclient.discovery import build
+            from googleapiclient.http import MediaFileUpload
+            self.logger.log("YouTube-API-Pakete verfuegbar")
+        except ImportError as e:
+            self.logger.error_and_exit(
+                f"YouTube-API-Pakete fehlen: {e}\n"
+                "Bitte installieren:\n"
+                "  pip install google-api-python-client google-auth-oauthlib google-auth-httplib2"
+            )
+
+    def _get_credentials(self) -> Any:
+        """Holt OAuth-Credentials."""
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        token_path = Path(YOUTUBE_TOKEN_FILE)
+        client_path = Path(YOUTUBE_CLIENT_SECRETS_FILE)
+        scopes = ["https://www.googleapis.com/auth/youtube"]
+        credentials = None
+        if token_path.exists():
+            try:
+                credentials = Credentials.from_authorized_user_file(str(token_path), scopes)
+                self.logger.log(f"Token-Datei geladen: {token_path}")
+            except Exception as e:
+                self.logger.log(f"Token ungueltig, neue Anmeldung erforderlich: {e}", "WARNING")
+                credentials = None
+        if not credentials or not credentials.valid:
+            if credentials and credentials.expired and credentials.refresh_token:
+                self.logger.log("Token wird erneuert...")
+                credentials.refresh(Request())
+                token_path.parent.mkdir(parents=True, exist_ok=True)
+                token_path.write_text(credentials.to_json(), encoding='utf-8')
+                self.logger.log(f"Erneuertes Token gespeichert: {token_path}")
+            else:
+                if not client_path.exists():
+                    self.logger.error_and_exit(f"YouTube Client-Datei fehlt: {client_path}")
+                self.logger.log("OAuth-Anmeldung im Browser...")
+                flow = InstalledAppFlow.from_client_secrets_file(str(client_path), scopes)
+                credentials = flow.run_local_server(port=0)
+                token_path.parent.mkdir(parents=True, exist_ok=True)
+                token_path.write_text(credentials.to_json(), encoding='utf-8')
+                self.logger.log(f"Token gespeichert: {token_path}")
+        return credentials
+
+    def get_service(self) -> Any:
+        """Erstellt YouTube-API-Service."""
+        from googleapiclient.discovery import build
+        if self.youtube is None:
+            credentials = self._get_credentials()
+            self.youtube = build("youtube", "v3", credentials=credentials)
+            self.logger.log("YouTube-Service initialisiert")
+        return self.youtube
+
+    def upload_video(self, video_path: Path, title: str, description: str, recording_date: str,
+                      custom_tags: str = "", privacy_override: Optional[str] = None) -> str:
+        """Laedt Video hoch und gibt Video-ID zurueck.
+
+        Fix v2.0.23: Finale Tag-Liste wird vor dem Upload explizit auf der
+        Konsole und im Log angezeigt, damit sichtbar ist, dass Tags aus einer
+        Beschreibungs-Vorlage tatsaechlich mit hochgeladen werden.
+        """
+        from googleapiclient.http import MediaFileUpload
+        youtube = self.get_service()
+        tags = list(YOUTUBE_TAGS)
+        if custom_tags:
+            additional_tags = [tag.strip() for tag in custom_tags.split(",") if tag.strip()]
+            for tag in additional_tags:
+                if tag not in tags:
+                    tags.append(tag)
+        print(f"  🏷️  Finale Tags fuer diesen Upload: {', '.join(tags)}")
+        self.logger.log(f"Finale Tags fuer Upload: {tags}")
+        effective_privacy = privacy_override or YOUTUBE_PRIVACY_STATUS
+        upload_body = {
+            "snippet": {
+                "title": title,
+                "description": description,
+                "tags": tags,
+                "categoryId": YOUTUBE_CATEGORY_ID,
+            },
+            "status": {
+                "privacyStatus": effective_privacy,
+                "publicStatsViewable": YOUTUBE_PUBLIC_STATS_VIEWABLE,
+                "embeddable": YOUTUBE_EMBEDDABLE,
+                "license": YOUTUBE_LICENSE,
+                "selfDeclaredMadeForKids": YOUTUBE_MADE_FOR_KIDS,
+                "containsSyntheticMedia": YOUTUBE_CONTAINS_SYNTHETIC_MEDIA,
+            },
+            "recordingDetails": {
+                "recordingDate": f"{recording_date}T00:00:00.000Z"
+            }
+        }
+        self.logger.log(f"Upload startet: {video_path.name}")
+        self.logger.log(f"Titel: {title}")
+        if privacy_override:
+            self.logger.log(f"Sichtbarkeit ueberschrieben durch Vorlage: {effective_privacy}")
+        request = youtube.videos().insert(
+            part="snippet,status,recordingDetails",
+            body=upload_body,
+            media_body=MediaFileUpload(str(video_path), mimetype="video/mp4", resumable=True),
+        )
+        response = request.execute()
+        video_id = response.get("id")
+        if not video_id:
+            raise RuntimeError("YouTube lieferte keine Video-ID")
+        self.logger.log(f"Upload erfolgreich | YouTube-ID: {video_id}")
+        return video_id
+
+    def add_to_playlist(self, video_id: str):
+        """Fuegt Video zur Playlist hinzu."""
+        if not YOUTUBE_PLAYLIST_ID or YOUTUBE_PLAYLIST_ID.startswith("HIER_"):
+            self.logger.log("Playlist-ID nicht konfiguriert, ueberspringe Playlist-Zuordnung", "WARNING")
+            return
+        youtube = self.get_service()
+        try:
+            youtube.playlistItems().insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "playlistId": YOUTUBE_PLAYLIST_ID,
+                        "resourceId": {
+                            "kind": "youtube#video",
+                            "videoId": video_id
+                        }
+                    }
+                },
+            ).execute()
+            self.logger.log(f"Playlist-Zuordnung erfolgreich | Playlist: {YOUTUBE_PLAYLIST_ID}")
+        except Exception as exc:
+            self.logger.log(f"Playlist-Zuordnung fehlgeschlagen: {exc}", "WARNING")
+
+# ============================================================================
+# Menü-Dialog
+# ============================================================================
+class MenuDialog:
+    """Interaktive Menü-Fuehrung."""
+    def __init__(self, logger: Logger, template_manager: BeschreibungTemplateManager):
+        self.logger = logger
+        self.template_manager = template_manager
+
+    def show_recording_list(self, recordings: List[Tuple[str, str, str]]) -> str:
+        """Liste der Aufnahmen anzeigen und Auswahl zurueckgeben."""
+        print("\n" + "="*60)
+        print("📁 Verfügbare Aufnahmen (neu nach alt):")
+        print("="*60)
+        for i, (folder, start_time, duration) in enumerate(recordings, 1):
+            print(f"{i:3}. {folder} | Start: {start_time} | Dauer: {duration}")
+        print("="*60)
+        while True:
+            try:
+                choice = input("\nAuswahl (Nummer): ").strip()
+                idx = int(choice) - 1
+                if 0 <= idx < len(recordings):
+                    selected = recordings[idx][0]
+                    self.logger.log(f"User waehlt Aufnahme: {selected}")
+                    return selected
+                else:
+                    print("Ungueltige Auswahl. Bitte Nummer eingeben.")
+            except ValueError:
+                print("Bitte eine gueltige Nummer eingeben.")
+
+    def get_target_fps(self) -> int:
+        """Ziel-FPS eingeben."""
+        print("\n" + "="*60)
+        print("🎞️  Ziel-Framerate (FPS) einstellen")
+        print("="*60)
+        print("  Empfohlene Werte:")
+        print("    24  – Kino-Look")
+        print("    25  – PAL (Europa)")
+        print("    30  – NTSC (USA), fluessig")
+        print("    50  – PAL High FPS")
+        print("    60  – NTSC High FPS, sehr fluessig")
+        print("   120  – Ultra Smooth (wenn Codec unterstuetzt)")
+        print("="*60)
+        while True:
+            try:
+                fps = int(input("\nZiel-FPS eingeben (Standard: 60): ").strip() or "60")
+                if fps >= 1 and fps <= 240:
+                    self.logger.log(f"User gibt Ziel-FPS ein: {fps}")
+                    return fps
+                else:
+                    print("FPS muss zwischen 1 und 240 liegen.")
+            except ValueError:
+                print("Bitte eine gueltige Zahl eingeben.")
+
+    def get_test_preview_duration(self) -> int:
+        """Dauer des Testrenders (Output-Laenge in Sekunden) abfragen."""
+        print("\n" + "="*60)
+        print("⏱️  Testrender-Dauer einstellen")
+        print("="*60)
+        print(f"  Wie lang soll die Testvorschau (Output) sein?")
+        print(f"  Standard: {DEFAULT_TEST_PREVIEW_DURATION}s. Empfehlung: 20-60s fuer einen")
+        print(f"  aussagekraeftigeren Eindruck als bei kurzen Clips.")
+        print("  Hinweis: Reicht das Material der groessten Datei nicht aus, wird das")
+        print("  Testrender automatisch verkuerzt und du wirst darauf hingewiesen.")
+        print("="*60)
+        while True:
+            try:
+                raw = input(f"\nTestrender-Dauer in Sekunden (Standard: {DEFAULT_TEST_PREVIEW_DURATION}): ").strip()
+                duration = int(raw) if raw else DEFAULT_TEST_PREVIEW_DURATION
+                if 1 <= duration <= 300:
+                    self.logger.log(f"User gibt Testrender-Dauer ein: {duration}s")
+                    return duration
+                else:
+                    print("Bitte einen Wert zwischen 1 und 300 Sekunden eingeben.")
+            except ValueError:
+                print("Bitte eine gueltige Zahl eingeben.")
+
+    def get_speed_factor(self) -> float:
+        """Faktor-Eingabe."""
+        while True:
+            try:
+                factor = float(input("\nGeschwindigkeitsfaktor (z.B. 2.0 für doppelte Geschwindigkeit): ").strip())
+                if factor > 0:
+                    self.logger.log(f"User gibt Faktor ein: {factor}")
+                    return factor
+                else:
+                    print("Faktor muss groesser als 0 sein.")
+            except ValueError:
+                print("Bitte eine gueltige Zahl eingeben (z.B. 2.0).")
+
+    def confirm_preview(self) -> bool:
+        """Zufrieden? (ja/nein)."""
+        while True:
+            choice = input("\nZufrieden mit der Vorschau? (j/n): ").strip().lower()
+            if choice in ['j', 'ja', 'y', 'yes']:
+                self.logger.log("User ist zufrieden mit Vorschau")
+                return True
+            elif choice in ['n', 'nein', 'no']:
+                self.logger.log("User ist NICHT zufrieden mit Vorschau")
+                return False
+            else:
+                print("Bitte 'j' oder 'n' eingeben.")
+
+    def prompt_title(self, recording_date: str) -> str:
+        """Titel interaktiv abfragen."""
+        print("\nTitel-Format: {DATE} - [Dein Titel]")
+        title = input(f"Titel ({recording_date} - ...): ").strip()
+        if not title.startswith(recording_date):
+            title = f"{recording_date} - {title}"
+        self.logger.log(f"Titel erfasst: {title}")
+        return title
+
+    def prompt_description(self, recording_date: str) -> str:
+        """Beschreibung interaktiv abfragen (mehrzeilig)."""
+        print("\nBeschreibung (mehrzeilig moeglich, mit Enter abschliessen):")
+        print("Tipp: Leere Zeile eingeben zum Abschliessen")
+        description_lines = []
+        while True:
+            line = input()
+            if line == "":
+                break
+            description_lines.append(line)
+        description = f"Aufnahme vom {recording_date}\nGoPro Hero 5 Black, 4K-Time-Lapse\n\n" + "\n".join(description_lines)
+        self.logger.log(f"Beschreibung erfasst: {description}")
+        return description
+
+    def prompt_tags(self) -> str:
+        """Zusaetzliche Tags interaktiv abfragen."""
+        print("\nIndividuelle Tags (optional, durch Komma getrennt):")
+        print(f"Standard: {', '.join(YOUTUBE_TAGS)}")
+        custom_tags = input("Zusaetzliche Tags (Enter zum ueberspringen): ").strip()
+        if custom_tags:
+            additional_tags = [tag.strip() for tag in custom_tags.split(",")]
+            self.logger.log(f"Zusaetzliche Tags: {additional_tags}")
+        return custom_tags
+
+    def select_beschreibung_template(self, templates: List[Path]) -> Optional[Path]:
+        """Zeigt gefundene Beschreibungs-Vorlagen zur Auswahl an."""
+        print("\n" + "="*60)
+        print("📄 Beschreibungs-Vorlagen gefunden")
+        print("="*60)
+        print("  0. (keine Vorlage) – Titel/Beschreibung/Tags manuell eingeben")
+        for i, t in enumerate(templates, 1):
+            try:
+                rel = t.relative_to(BESCHREIBUNG_DIR)
+            except ValueError:
+                rel = t.name
+            print(f"{i:3}. {rel}")
+        print("="*60)
+        while True:
+            choice = input("\nVorlage auswaehlen (Nummer, 0 = manuell): ").strip()
+            try:
+                idx = int(choice)
+            except ValueError:
+                print("Bitte eine gueltige Nummer eingeben.")
+                continue
+            if idx == 0:
+                self.logger.log("User waehlt manuelle Eingabe (keine Vorlage)")
+                return None
+            if 1 <= idx <= len(templates):
+                selected = templates[idx - 1]
+                self.logger.log(f"User waehlt Vorlage: {selected}")
+                return selected
+            print("Ungueltige Auswahl.")
+
+    def get_job_details(self, recording_date: str) -> Tuple[str, str, str, str, Optional[str]]:
+        """Titel, Beschreibung, Tags ermitteln - optional aus einer
+        Beschreibungs-Vorlage aus dem Zentralordner."""
+        print("\n" + "="*60)
+        print("📝 Job-Details eingeben")
+        print("="*60)
+        print(f"Aufnahmedatum: {recording_date}")
+        print(f"Standard-Tags: {YOUTUBE_TAGS}")
+        print("="*60)
+
+        prefill: Dict[str, str] = {}
+        templates = self.template_manager.find_templates()
+        if templates:
+            chosen = self.select_beschreibung_template(templates)
+            if chosen:
+                prefill = self.template_manager.parse(chosen)
+                print(f"\n📄 Vorlage geladen: {chosen.name}")
+                if not prefill:
+                    print("   (Vorlage enthielt keine erkennbaren Abschnitte - alles wird manuell abgefragt.)")
+                for key, value in prefill.items():
+                    preview = value if len(value) <= 80 else value[:77] + "..."
+                    preview = preview.replace("\n", " ")
+                    print(f"   ✓ {key}: {preview}")
+
+        effective_recording_date = prefill.get("recording_date", recording_date)
+        if "recording_date" in prefill:
+            print(f"\nℹ️  Aufnahmedatum aus Vorlage uebernommen: {effective_recording_date}")
+            self.logger.log(f"Aufnahmedatum durch Vorlage ueberschrieben: {effective_recording_date}")
+
+        if prefill.get("title"):
+            title = prefill["title"]
+            if not title.startswith(effective_recording_date):
+                title = f"{effective_recording_date} - {title}"
+            print(f"\n✅ Titel aus Vorlage: {title}")
+        else:
+            title = self.prompt_title(effective_recording_date)
+
+        if prefill.get("description"):
+            description = prefill["description"]
+            print(f"✅ Beschreibung aus Vorlage uebernommen ({len(description)} Zeichen).")
+        else:
+            description = self.prompt_description(effective_recording_date)
+
+        if prefill.get("tags"):
+            custom_tags = prefill["tags"]
+            print(f"✅ Tags aus Vorlage: {custom_tags}")
+        else:
+            custom_tags = self.prompt_tags()
+
+        privacy_override = prefill.get("privacy_status")
+        if privacy_override:
+            print(f"ℹ️  Sichtbarkeit aus Vorlage uebernommen: {privacy_override} (ueberschreibt Standard aus Config)")
+            self.logger.log(f"Sichtbarkeit durch Vorlage ueberschrieben: {privacy_override}")
+
+        self.logger.log(f"Titel final: {title}")
+        self.logger.log(f"Beschreibung final: {description}")
+        return title, description, custom_tags, effective_recording_date, privacy_override
+
+    def confirm_job(self, job_summary: Dict[str, Any]):
+        """Auftragszusammenfassung anzeigen und bestaetigen lassen."""
+        print("\n" + "="*80)
+        print("📋 AUFTRAGSZUSAMMENFASSUNG")
+        print("="*80)
+        for key, value in job_summary.items():
+            print(f"{key:20}: {value}")
+        print("="*80)
+        print("\n⚠️  ACHTUNG: Nach Bestaetigung laufen Rendern und Upload OHNE weitere Eingabe!")
+        print("="*80)
+        while True:
+            choice = input("\nRendern und anschliessend automatisch hochladen? (j/n): ").strip().lower()
+            if choice in ['j', 'ja', 'y', 'yes']:
+                self.logger.log("User hat Auftrag bestaetigt")
+                return True
+            elif choice in ['n', 'nein', 'no']:
+                self.logger.log("User hat Auftrag ABGEBROCHEN")
+                return False
+            else:
+                print("Bitte 'j' oder 'n' eingeben.")
+
+    def show_pending_uploads(self, pending: List[Path]) -> List[Path]:
+        """Zeigt gerenderte Videos ohne Uploadmarker und laesst Auswahl treffen."""
+        print("\n" + "="*60)
+        print("📤 Offene Uploads gefunden")
+        print("="*60)
+        print("Folgende bereits gerenderte Videos haben noch keinen Uploadmarker")
+        print("(z.B. weil ein vorheriger Upload fehlgeschlagen ist):")
+        print("="*60)
+        for i, video in enumerate(pending, 1):
+            size_mb = video.stat().st_size / (1024 * 1024)
+            mtime = datetime.fromtimestamp(video.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            print(f"{i:3}. {video.name} | {size_mb:.0f} MB | erstellt: {mtime}")
+        print("="*60)
+        print("Optionen:")
+        print("  a       = alle jetzt hochladen")
+        print("  1,3     = einzelne Nummern hochladen (durch Komma getrennt)")
+        print("  n       = ueberspringen und mit normalem Ablauf fortfahren")
+        while True:
+            choice = input("\nAuswahl: ").strip().lower()
+            if choice in ['n', 'nein', 'no', '']:
+                self.logger.log("User ueberspringt offene Uploads")
+                return []
+            if choice in ['a', 'alle', 'all']:
+                self.logger.log(f"User laedt alle {len(pending)} offenen Uploads hoch")
+                return list(pending)
+            try:
+                indices = [int(part.strip()) - 1 for part in choice.split(",") if part.strip()]
+                selected = [pending[i] for i in indices if 0 <= i < len(pending)]
+                if selected:
+                    self.logger.log(f"User waehlt {len(selected)} offene Uploads aus")
+                    return selected
+                print("Keine gueltigen Nummern erkannt. Bitte erneut eingeben.")
+            except ValueError:
+                print("Bitte 'a', 'n' oder Nummern durch Komma getrennt eingeben.")
+
+    def get_resume_upload_details(self, video_path: Path, recording_date: str) -> Tuple[str, str, str, str, Optional[str]]:
+        """Titel/Beschreibung fuer einen Resume-Upload eingeben (ohne Rendern)."""
+        print("\n" + "="*60)
+        print(f"📝 Job-Details fuer Resume-Upload: {video_path.name}")
+        print("="*60)
+        return self.get_job_details(recording_date)
+
+    def confirm_continue_with_new_job(self) -> bool:
+        """Nach Abarbeiten offener Uploads fragen, ob das Programm beendet werden soll."""
+        while True:
+            choice = input("\nMoechtest du jetzt eine neue Aufnahme verarbeiten? (j/n): ").strip().lower()
+            if choice in ['j', 'ja', 'y', 'yes']:
+                self.logger.log("User setzt mit neuem Job fort")
+                return True
+            elif choice in ['n', 'nein', 'no']:
+                self.logger.log("User beendet Programm nach Resume-Uploads")
+                return False
+            else:
+                print("Bitte 'j' oder 'n' eingeben.")
+
+# ============================================================================
+# Hauptprozessor
+# ============================================================================
+class GoProTimeLapseProcessor:
+    """Hauptprozessor fuer GoPro-Zeitraffer."""
+    def __init__(self, base_dir: str = "./aufnahmen"):
+        self.base_dir = Path(base_dir)
+        self.logger = Logger()
+        self.ffmpeg = FFmpegHandler(self.logger)
+        self.vlc = VLCPlayer(self.logger)
+        self.template_manager = BeschreibungTemplateManager(self.logger, BESCHREIBUNG_DIR)
+        self.menu = MenuDialog(self.logger, self.template_manager)
+        self.uploader = YouTubeUploader(self.logger)
+        self.marker = UploadMarker(self.logger)
+        self.archiver = ArchiveManager(self.logger)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        BESCHREIBUNG_DIR.mkdir(parents=True, exist_ok=True)
+        self._preview_source_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self.logger.log(f"GoProTimeLapseProcessor v{__VERSION__} initialisiert")
+        self.logger.log(f"Basis: {self.base_dir.absolute()}")
+        self.logger.log(f"Output: {OUTPUT_DIR.absolute()}")
+        self.logger.log(f"Archiv: {ARCHIVE_DIR.absolute()}")
+        self.logger.log(f"Beschreibungs-Vorlagen: {BESCHREIBUNG_DIR.absolute()}")
+
+    def list_recordings(self) -> List[Tuple[str, str, str]]:
+        """Liste der Ordner (neu nach alt) mit Startzeit und geschaetzter Dauer."""
+        if not self.base_dir.exists():
+            self.logger.error_and_exit(f"Basisverzeichnis existiert nicht: {self.base_dir}")
+        recordings = []
+        for folder in self.base_dir.iterdir():
+            if folder.is_dir():
+                mp4_files = sorted(folder.glob("*.MP4"), key=lambda f: f.stat().st_mtime)
+                if mp4_files:
+                    oldest = mp4_files[0]
+                    newest = mp4_files[-1]
+                    start_time = datetime.fromtimestamp(oldest.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                    duration_seconds = newest.stat().st_mtime - oldest.stat().st_mtime
+                    duration_str = f"{int(duration_seconds // 3600)}h {int((duration_seconds % 3600) // 60)}min"
+                    recordings.append((folder.name, start_time, duration_str))
+        recordings.sort(key=lambda x: x[1], reverse=True)
+        self.logger.log(f"{len(recordings)} Aufnahmen gefunden")
+        return recordings
+
+    def select_recording(self, folder_name: str) -> Path:
+        """User waehlt Ordner aus."""
+        selected = self.base_dir / folder_name
+        if not selected.exists():
+            self.logger.error_and_exit(f"Ausgewaehlter Ordner existiert nicht: {selected}")
+        self.logger.log(f"Ausgewaehlter Ordner: {selected}")
+        return selected
+
+    def estimate_duration(self, folder: Path) -> float:
+        """Dauer aus Zeitstempeln abschaetzen."""
+        mp4_files = sorted(folder.glob("*.MP4"), key=lambda f: f.stat().st_mtime)
+        if not mp4_files:
+            return 0.0
+        oldest = mp4_files[0].stat().st_mtime
+        newest = mp4_files[-1].stat().st_mtime
+        duration = newest - oldest
+        self.logger.log(f"Geschaetzte Dauer: {int(duration // 3600)}h {int((duration % 3600) // 60)}min ({int(duration)}s)")
+        return duration
+
+    def preview_first_clip(self, folder: Path):
+        """Ersten Clip fuer 20s abspielen."""
+        mp4_files = sorted(folder.glob("*.MP4"), key=lambda f: f.stat().st_mtime)
+        if not mp4_files:
+            self.logger.error_and_exit(f"Keine MP4-Dateien in {folder}")
+        first_clip = mp4_files[0]
+        self.logger.log(f"Erste Vorschau: {first_clip.name}")
+        print(f"\n▶️  Erste Vorschau (20s): {first_clip.name}")
+        self.vlc.play(str(first_clip), duration=20, force_foreground=True)
+
+    def render_preview(self, folder: Path, factor: float, fps: int, preview_duration: int = DEFAULT_TEST_PREVIEW_DURATION):
+        """Testrender - verwendet AUSSCHLIESSLICH die groesste LRV-Datei
+        (bzw. groesste MP4-Datei, falls keine LRV vorhanden ist) als Quelle."""
+        lrv_files = sorted(folder.glob("*.LRV"), key=lambda f: f.stat().st_mtime)
+        if lrv_files:
+            candidate_files = lrv_files
+            file_pattern = "*.LRV"
+            source_label = "LRV"
+        else:
+            candidate_files = sorted(folder.glob("*.MP4"), key=lambda f: f.stat().st_mtime)
+            file_pattern = "*.MP4"
+            source_label = "MP4"
+        if not candidate_files:
+            self.logger.error_and_exit(f"Keine Dateien ({file_pattern}) gefunden in: {folder}")
+
+        cache_key = (str(folder), file_pattern)
+        cached = self._preview_source_cache.get(cache_key)
+        if cached and Path(cached["path"]).exists():
+            largest_file = Path(cached["path"])
+            file_duration = cached["duration"]
+            size_mb = cached["size_mb"]
+            print(f"\n♻️  Groesste {source_label}-Datei aus Cache: {largest_file.name} ({size_mb:.0f} MB, {file_duration:.1f}s)")
+        else:
+            largest_file = max(candidate_files, key=lambda f: f.stat().st_size)
+            size_mb = largest_file.stat().st_size / (1024 * 1024)
+            file_duration = self.ffmpeg.get_duration(str(largest_file))
+            print(f"\n📌 Testrender verwendet ausschliesslich die groesste {source_label}-Datei:")
+            print(f"   {largest_file.name} ({size_mb:.0f} MB, {file_duration:.1f}s, von {len(candidate_files)} verfuegbaren Dateien)")
+            self.logger.log(
+                f"Groesste {source_label}-Datei fuer Testrender gewaehlt: {largest_file.name} "
+                f"({size_mb:.1f} MB, {file_duration:.1f}s) von {len(candidate_files)} Dateien"
+            )
+            self._preview_source_cache[cache_key] = {
+                "path": str(largest_file), "duration": file_duration, "size_mb": size_mb
+            }
+
+        required_source_duration = preview_duration * factor
+        actual_test_duration = float(preview_duration)
+        if file_duration <= 0:
+            self.logger.error_and_exit(
+                f"Dauer von {largest_file.name} konnte nicht ermittelt werden "
+                "(ffprobe-Fehler oder beschaedigte Datei). Testrender abgebrochen."
+            )
+        if file_duration < required_source_duration - 0.5:
+            actual_test_duration = max(1.0, file_duration / factor)
+            print(f"  ⚠️  Groesste Datei bietet nur {file_duration:.0f}s Material statt der "
+                  f"benoetigten {required_source_duration:.0f}s (fuer {preview_duration}s Output bei Faktor {factor}).")
+            print(f"  ⚠️  Testrender wird auf {actual_test_duration:.1f}s statt {preview_duration}s verkuerzt.")
+            self.logger.log(
+                f"Testrender verkuerzt: {file_duration:.1f}s verfuegbar (groesste Datei), "
+                f"{required_source_duration:.1f}s benoetigt (Faktor {factor})", "WARNING"
+            )
+
+        preview = str(TEMP_DIR / f"preview_{preview_duration}s.mp4")
+        self.ffmpeg.adjust_speed_with_progress(str(largest_file), preview, factor, fps=fps, duration=actual_test_duration, is_test=True)
+        print(f"\n▶️  Testvorschau ({actual_test_duration:.1f}s, Faktor {factor}, {fps} FPS):")
+        self.vlc.play(preview, force_foreground=True)
+        if Path(preview).exists():
+            Path(preview).unlink()
+            self.logger.log(f"Temp-Datei geloescht: {preview}")
+
+    def cleanup_preview_temp_files(self):
+        """Leert den Preview-Source-Cache nach Abschluss der Testrender-Phase."""
+        for name in ("combined_lrv.mp4", "combined.mp4"):
+            f = TEMP_DIR / name
+            if f.exists():
+                try:
+                    f.unlink()
+                    self.logger.log(f"Alte Temp-Zwischendatei geloescht: {f}")
+                except OSError as e:
+                    self.logger.log(f"Konnte Temp-Zwischendatei nicht loeschen: {f} ({e})", "WARNING")
+        self._preview_source_cache.clear()
+
+    def render_final(self, folder: Path, factor: float, fps: int, output_path: Path):
+        """Finalrender mit Faktor und Fortschrittsanzeige (immer MP4 in voller Qualität,
+        immer ALLE Dateien - auch sehr kleine - kein Wiederverwenden alter combined.mp4)."""
+        combined = str(TEMP_DIR / "combined.mp4")
+        self.ffmpeg.concat_files(str(folder), combined, file_pattern="*.MP4")
+        print(f"\n🎬 Finalrender (Faktor {factor}, {fps} FPS):")
+        self.ffmpeg.adjust_speed_with_progress(combined, str(output_path), factor, fps=fps, is_test=False)
+        self.logger.log(f"Finalvideo erstellt: {output_path}")
+        print(f"✅ Finalvideo: {output_path}")
+
+    def upload_video(self, video_path: Path, title: str, description: str, recording_date: str,
+                      custom_tags: str = "", playlist_id: str = None, privacy_override: Optional[str] = None) -> str:
+        """Laedt Video hoch und gibt Video-ID zurueck."""
+        video_id = self.uploader.upload_video(video_path, title, description, recording_date, custom_tags, privacy_override)
+        self.uploader.add_to_playlist(video_id)
+        return video_id
+
+    def find_pending_uploads(self) -> List[Path]:
+        """Findet gerenderte MP4s in OUTPUT_DIR, die noch keinen (gueltigen) Uploadmarker haben."""
+        if not OUTPUT_DIR.exists():
+            return []
+        pending = []
+        for video in sorted(OUTPUT_DIR.glob("*.mp4"), key=lambda f: f.stat().st_mtime):
+            if self.marker.read_marker(video) is None:
+                pending.append(video)
+        if pending:
+            self.logger.log(f"{len(pending)} offene(r) Upload(s) ohne Marker in {OUTPUT_DIR} gefunden")
+        return pending
+
+    def get_recording_date_from_folder(self, folder: Path) -> Optional[str]:
+        """Versucht, das echte Aufnahmedatum aus den Video-Metadaten
+        (creation_time) der AELTESTEN MP4-Datei im gegebenen Ordner zu lesen.
+
+        NEU in v2.0.23: gemeinsam genutzte Hilfsfunktion fuer
+        derive_recording_date_from_folder() (normaler Ablauf) UND
+        guess_recording_date() (Resume-Upload). Liefert None, wenn der Ordner
+        nicht (mehr) existiert, keine MP4-Dateien enthaelt, oder die Datei
+        kein 'creation_time'-Metadatenfeld besitzt.
+        """
+        if not folder.exists():
+            return None
+        mp4_files = sorted(folder.glob("*.MP4"), key=lambda f: f.stat().st_mtime)
+        if not mp4_files:
+            return None
+        first_file = mp4_files[0]
+        creation_date = self.ffmpeg.get_creation_time(str(first_file))
+        if creation_date:
+            self.logger.log(f"Aufnahmedatum aus Video-Metadaten gelesen: {first_file.name} -> {creation_date}")
+        return creation_date
+
+    def guess_recording_date(self, video_path: Path) -> str:
+        """Leitet ein Aufnahmedatum fuer den Resume-Upload-Pfad ab.
+
+        Fix v2.0.23: video_path ist hier die bereits gerenderte Datei in
+        OUTPUT_DIR (Name: '<aufnahmeordner>_final.mp4'), NICHT die
+        Original-GoPro-Datei. Der bisherige Fallback (Datei-Zeitstempel der
+        Ausgabedatei) zeigte faelschlich das Render-Datum statt des echten
+        Aufnahmedatums. Jetzt wird zunaechst versucht, den urspruenglichen
+        Aufnahmeordner ueber den Dateinamen zu rekonstruieren und daraus das
+        echte Datum per Video-Metadaten zu lesen (siehe
+        get_recording_date_from_folder()). Nur wenn das nicht moeglich ist
+        (Ordner geloescht/verschoben), wird auf den Datei-Zeitstempel
+        zurueckgefallen.
+        """
+        match = re.match(r"(\d{4}-\d{2}-\d{2})", video_path.stem)
+        if match:
+            return match.group(1)
+        original_folder_name = video_path.stem
+        if original_folder_name.endswith("_final"):
+            original_folder_name = original_folder_name[: -len("_final")]
+        original_folder = self.base_dir / original_folder_name
+        metadata_date = self.get_recording_date_from_folder(original_folder)
+        if metadata_date:
+            return metadata_date
+        self.logger.log(
+            f"Aufnahmeordner fuer {video_path.name} nicht auffindbar oder ohne "
+            "Metadaten - verwende Datei-Zeitstempel als Fallback (kann falsch sein)",
+            "WARNING"
+        )
+        return datetime.fromtimestamp(video_path.stat().st_mtime).strftime("%Y-%m-%d")
+
+    def derive_recording_date_from_folder(self, folder: Path) -> str:
+        """Ermittelt das Aufnahmedatum eines Aufnahmeordners.
+
+        Fix v2.0.23: Reihenfolge jetzt 1) YYYY-MM-DD-Praefix im Ordnernamen,
+        2) echtes Aufnahmedatum aus den Video-Metadaten (creation_time) der
+        aeltesten MP4-Datei - bleibt beim Kopieren der Dateien korrekt,
+        anders als der Dateisystem-Zeitstempel, 3) nur wenn beides fehlschlaegt,
+        Fallback auf den Datei-Zeitstempel (mit Warnung, da potenziell falsch),
+        4) heutiges Datum nur wenn ueberhaupt keine MP4-Dateien vorhanden sind.
+        """
+        match = re.match(r"(\d{4}-\d{2}-\d{2})", folder.name)
+        if match:
+            return match.group(1)
+        metadata_date = self.get_recording_date_from_folder(folder)
+        if metadata_date:
+            return metadata_date
+        mp4_files = sorted(folder.glob("*.MP4"), key=lambda f: f.stat().st_mtime)
+        if mp4_files:
+            self.logger.log(
+                f"Kein Aufnahmedatum in Video-Metadaten von {mp4_files[0].name} gefunden - "
+                "verwende Datei-Zeitstempel als Fallback (kann bei kopierten Dateien "
+                "falsch sein, z.B. das Kopierdatum statt des Aufnahmedatums zeigen)",
+                "WARNING"
+            )
+            return datetime.fromtimestamp(mp4_files[0].stat().st_mtime).strftime("%Y-%m-%d")
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def resume_pending_uploads(self, pending: List[Path]):
+        """Fuehrt fuer eine Liste bereits gerenderter Videos nur den Upload (+ Archivierung) aus."""
+        for video_path in pending:
+            if not video_path.exists():
+                self.logger.log(f"Video nicht mehr vorhanden, ueberspringe: {video_path}", "WARNING")
+                continue
+            recording_date = self.guess_recording_date(video_path)
+            title, description, custom_tags, recording_date, privacy_override = self.menu.get_resume_upload_details(video_path, recording_date)
+            print(f"\n📤 Upload wird gestartet: {video_path.name}")
+            try:
+                video_id = self.upload_video(video_path, title, description, recording_date, custom_tags, privacy_override=privacy_override)
+                self.marker.write_marker(video_path, video_id, title, YOUTUBE_PLAYLIST_ID)
+                print("\n📂 Archivierung...")
+                self.archiver.archive_with_retry(video_path)
+                print(f"✅ Resume-Upload abgeschlossen | YouTube-ID: {video_id}")
+                self.logger.log(f"Resume-Upload abgeschlossen: {video_path.name} -> {video_id}")
+            except Exception as exc:
+                self.logger.log(f"Resume-Upload fehlgeschlagen fuer {video_path.name}: {exc}", "ERROR")
+                print(f"❌ Resume-Upload fehlgeschlagen: {exc}")
+                print(f"Video bleibt in: {video_path}")
+
+def show_version():
+    """Zeigt Versionsinformationen."""
+    print("="*60)
+    print("🎬 GoPro Time-Lapse Vibe-Coding Processor")
+    print("="*60)
+    print(f"Version: {__VERSION__}")
+    print(f"Datum:   {__DATUM__}")
+    print(f"Info:    {__BESCHREIBUNG__}")
+    print("="*60)
+
+def main():
+    """Hauptmenue und Ablaufsteuerung."""
+    show_version()
+    processor = GoProTimeLapseProcessor("./aufnahmen/")
+
+    # 0. Offene Uploads pruefen und optional zuerst abarbeiten
+    pending = processor.find_pending_uploads()
+    if pending:
+        selected = processor.menu.show_pending_uploads(pending)
+        if selected:
+            processor.resume_pending_uploads(selected)
+            if not processor.menu.confirm_continue_with_new_job():
+                print("\n👋 Programm wird beendet.")
+                return
+            print("\n" + "="*60)
+            print("↩️  Zurueck zum normalen Ablauf...")
+            print("="*60)
+
+    # 1. Ordnerauswahl
+    recordings = processor.list_recordings()
+    if not recordings:
+        processor.logger.error_and_exit("Keine Aufnahmen gefunden in ./aufnahmen/")
+    selected_folder_name = processor.menu.show_recording_list(recordings)
+    selected_folder = processor.select_recording(selected_folder_name)
+    duration = processor.estimate_duration(selected_folder)
+
+    # 2. Erste Vorschau
+    print("\n" + "="*60)
+    print("📹 Erste Vorschau")
+    print("="*60)
+    processor.preview_first_clip(selected_folder)
+
+    # 3. Ziel-FPS einstellen
+    print("\n" + "="*60)
+    print("⚙️  Einstellungen")
+    print("="*60)
+    target_fps = processor.menu.get_target_fps()
+
+    # 3b. Testrender-Dauer einstellen (einmalig vor der Faktor-Testschleife)
+    preview_duration = processor.menu.get_test_preview_duration()
+
+    # 4. Geschwindigkeitsfaktor testen (iterativ)
+    print("\n" + "="*60)
+    print("⚙️  Geschwindigkeitsfaktor testen")
+    print("="*60)
+    while True:
+        factor = processor.menu.get_speed_factor()
+        processor.render_preview(selected_folder, factor, target_fps, preview_duration)
+        if processor.menu.confirm_preview():
+            break
+        else:
+            print("\n→ Bitte neuen Faktor eingeben...")
+
+    processor.cleanup_preview_temp_files()
+
+    # 5. Job-Details eingeben (inkl. optionaler Beschreibungs-Vorlage)
+    print("\n" + "="*60)
+    print("📝 Job-Details")
+    print("="*60)
+    recording_date = processor.derive_recording_date_from_folder(selected_folder)
+    title, description, custom_tags, recording_date, privacy_override = processor.menu.get_job_details(recording_date)
+
+    # 6. Auftragszusammenfassung
+    expected_duration_sec = duration / factor
+    expected_duration_str = f"{int(expected_duration_sec // 60)}min {int(expected_duration_sec % 60)}s"
+    job_summary = {
+        "Aufnahme": selected_folder_name,
+        "Ziel-FPS": str(target_fps),
+        "Faktor": str(factor),
+        "Erwartete Dauer": expected_duration_str,
+        "Titel": title,
+        "Sichtbarkeit": privacy_override or YOUTUBE_PRIVACY_STATUS,
+        "Playlist-ID": YOUTUBE_PLAYLIST_ID,
+        "Output-Pfad": str(OUTPUT_DIR),
+        "Archiv-Pfad": str(ARCHIVE_DIR),
+    }
+    if not processor.menu.confirm_job(job_summary):
+        processor.logger.log("Auftrag vom User abgebrochen")
+        print("\n❌ Auftrag abgebrochen.")
+        return
+
+    # 7. Finalrender
+    print("\n" + "="*60)
+    print("🎬 Finalrender")
+    print("="*60)
+    output_filename = f"{selected_folder_name}_final.mp4"
+    output_path = OUTPUT_DIR / output_filename
+    processor.render_final(selected_folder, factor, target_fps, output_path)
+
+    # 8. YouTube-Upload
+    print("\n" + "="*60)
+    print("📤 YouTube-Upload")
+    print("="*60)
+    try:
+        video_id = processor.upload_video(output_path, title, description, recording_date, custom_tags, privacy_override=privacy_override)
+        processor.marker.write_marker(output_path, video_id, title, YOUTUBE_PLAYLIST_ID)
+        print("\n📂 Archivierung...")
+        processor.archiver.archive_with_retry(output_path)
+        processor.logger.log("Verarbeitung abgeschlossen")
+        print("\n" + "="*60)
+        print("✅ VERARBEITUNG ABGESCHLOSSEN!")
+        print("="*60)
+        print(f"YouTube-Video-ID: {video_id}")
+        print(f"Archiviert: {ARCHIVE_DIR / output_filename}")
+        print("="*60)
+    except Exception as exc:
+        processor.logger.log(f"Upload fehlgeschlagen: {exc}", "ERROR")
+        print(f"\n❌ Upload fehlgeschlagen: {exc}")
+        print(f"Video bleibt in: {output_path}")
+        print("Beim naechsten Start wird der Upload automatisch als offen erkannt")
+        print("und du kannst ihn direkt nachholen (siehe Menuepunkt 'Offene Uploads').")
+
+if __name__ == "__main__":
+    main()
